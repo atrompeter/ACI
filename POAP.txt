@@ -1,0 +1,636 @@
+
+
+1 #!/bin/env python 
+2 #md5sum=5fddae8efacfc3b6acff9beb2a9e8bf3 
+3 # Still needs to be implemented. 
+4 # Return Values: 
+5 # 0 : Reboot and reapply configuration 
+6 # 1 : No reboot, just apply configuration. Customers issue copy file run ; copy 
+7 # run start. Do not use scheduled-config since there is no reboot needed. i.e. 
+8 # no new image was downloaded 
+9 # -1 : Error case. This will cause POAP to restart the DHCP discovery phase.  
+10 
+ 
+11 # The above is the (embedded) md5sum of this file taken without this line,  
+12 # can be # created this way:  
+13 # f=poap.py ; cat $f | sed '/^#md5sum/d' > $f.md5 ; sed -i "s/^#md5sum=.*/#md5sum=$(md5sum $f.md5 | sed 's/ .*//')/" $f 
+14 # This way this script's integrity can be checked in case you do not trust 
+15 # tftp's ip checksum. This integrity check is done by /isan/bin/poap.bin). 
+16 # The integrity of the files downloaded later (images, config) is checked  
+17 # by downloading the corresponding file with the .md5 extension and is 
+18 # done by this script itself. 
+19 
+ 
+20 import os 
+21 import time 
+22 from cli import * 
+23 
+ 
+24 # **** Here are all variables that parametrize this script ****  
+25 # These parameters should be updated with the real values used  
+26 # in your automation environment 
+27 
+ 
+28 # system and kickstart images, configuration: location on server (src) and target (dst) 
+29 n9k_image_version       = "6.1.2" 
+30 image_dir_src           = "/tftpb" 
+31 ftp_image_dir_src_root  = image_dir_src 
+32 tftp_image_dir_src_root = image_dir_src 
+33 n9k_system_image_src    = "n9000-dk9.%s.bin" % n9k_image_version 
+34 config_file_src         = "/tftpb/poap.cfg"  
+35 image_dir_dst           = "bootflash:poap" 
+36 system_image_dst        = n9k_system_image_src 
+37 config_file_dst         = "volatile:poap.cfg" 
+38 md5sum_ext_src          = "md5" 
+39 # Required space on /bootflash (for config and system images) 
+40 required_space          = 350000 
+41 
+ 
+42 # copy protocol to download images and config 
+43 # options are: scp/http/tftp/ftp/sftp 
+44 protocol                = "scp" # protocol to use to download images/config 
+45 
+ 
+46 # Host name and user credentials 
+47 username                = "root" # tftp server account 
+48 ftp_username            = "anonymous" # ftp server account 
+49 password                = "root" 
+50 hostname                = "1.1.1.1" 
+51 
+ 
+52 # vrf info 
+53 vrf = "management" 
+54 if os.environ.has_key('POAP_VRF'): 
+55     vrf=os.environ['POAP_VRF'] 
+56 
+ 
+57 # Timeout info (from biggest to smallest image, should be f(image-size, protocol)) 
+58 system_timeout          = 2100  
+59 config_timeout          = 120  
+60 md5sum_timeout          = 120   
+61 
+ 
+62 # POAP can use 3 modes to obtain the config file. 
+63 # - 'static' - filename is static 
+64 # - 'serial_number' - switch serial number is part of the filename 
+65 # - 'location' - CDP neighbor of interface on which DHCPDISCOVER arrived 
+66 #                is part of filename 
+67 # if serial-number is abc, then filename is $config_file_src.abc 
+68 # if cdp neighbor's device_id=abc and port_id=111, then filename is config_file_src.abc_111 
+69 # Note: the next line can be overwritten by command-line arg processing later 
+70 config_file_type        = "static" 
+71 
+ 
+72 # parameters passed through environment: 
+73 # TODO: use good old argv[] instead, using env is bad idea. 
+74 # pid is used for temp file name: just use getpid() instead! 
+75 # serial number should be gotten from "show version" or something! 
+76 pid="" 
+77 if os.environ.has_key('POAP_PID'): 
+78     pid=os.environ['POAP_PID'] 
+79 serial_number=None 
+80 if os.environ.has_key('POAP_SERIAL'): 
+81     serial_number=os.environ['POAP_SERIAL'] 
+82 cdp_interface=None 
+83 if os.environ.has_key('POAP_INTF'): 
+84     cdp_interface=os.environ['POAP_INTF'] 
+85 
+ 
+86 # will append date/timespace into the name later 
+87 log_filename = "/bootflash/poap.log" 
+88 t=time.localtime() 
+89 now="%d_%d_%d" % (t.tm_hour, t.tm_min, t.tm_sec) 
+90 #now=None 
+91 #now=1 # hardcode timestamp (easier while debugging) 
+92 
+ 
+93 # **** end of parameters ****  
+94 # ************************************************************* 
+95 
+ 
+96 # ***** argv parsing and online help (for test through cli) ****** 
+97 # **************************************************************** 
+98 
+ 
+99 # poap.bin passes args (serial-number/cdp-interface) through env var 
+100 # for no seeminly good reason: we allow to overwrite those by passing 
+101 # argv, this is usufull when testing the script from vsh (even simple 
+102 # script have many cases to test, going through a reboto takes too long) 
+103 
+ 
+104 import sys 
+105 import re 
+106 
+ 
+107 cl_cdp_interface=None  # Command Line version of cdp-interface 
+108 cl_serial_number=None  # can overwrite the corresp. env var 
+109 cl_protocol=None       # can overwride the script's default 
+110 cl_download_only=None  # dont write boot variables 
+111 
+ 
+112 def parse_args(argv, help=None): 
+113     global cl_cdp_interface, cl_serial_number, cl_protocol, protocol, cl_download_only 
+114     while argv: 
+115         x = argv.pop(0) 
+116         # not handling duplicate matches... 
+117         if cmp('cdp-interface'[0:len(x)], x) == 0: 
+118           try: cl_cdp_interface = argv.pop(0) 
+119           except:  
+120              if help: cl_cdp_interface=-1 
+121           if len(x) != len('cdp-interface') and help: cl_cdp_interface=None 
+122           continue 
+123         if cmp('serial-number'[0:len(x)], x) == 0: 
+124           try: cl_serial_number = argv.pop(0) 
+125           except:  
+126             if help: cl_serial_number=-1 
+127           if len(x) != len('serial-number') and help: cl_serial_number=None 
+128           continue 
+129         if cmp('protocol'[0:len(x)], x) == 0: 
+130           try: cl_protocol = argv.pop(0);  
+131           except:  
+132             if help: cl_protocol=-1 
+133           if len(x) != len('protocol') and help: cl_protocol=None 
+134           if cl_protocol: protocol=cl_protocol 
+135           continue 
+136         if cmp('download-only'[0:len(x)], x) == 0: 
+137           cl_download_only = 1 
+138           continue 
+139         print "Syntax Error|invalid token:", x 
+140         exit(-1) 
+141    
+142 
+ 
+143 ########### display online help (if asked for) ################# 
+144 nb_args = len(sys.argv) 
+145 if nb_args > 1: 
+146   m = re.match('__cli_script.*help', sys.argv[1]) 
+147   if m: 
+148     # first level help: display script description 
+149     if sys.argv[1] == "__cli_script_help": 
+150       print "loads system/kickstart images and config file for POAP\n" 
+151       exit(0) 
+152     # argument help 
+153     argv = sys.argv[2:] 
+154     # dont count last arg if it was partial help (no-space-question-mark) 
+155     if sys.argv[1] == "__cli_script_args_help_partial": 
+156       argv = argv[:-1] 
+157     parse_args(argv, "help") 
+158     if cl_serial_number==-1: 
+159       print "WORD|Enter the serial number" 
+160       exit(0) 
+161     if cl_cdp_interface==-1: 
+162       print "WORD|Enter the CDP interface instance" 
+163       exit(0) 
+164     if cl_protocol==-1: 
+165       print "tftp|Use tftp for file transfer protocol" 
+166       print "ftp|Use ftp for file transfer protocol" 
+167       print "scp|Use scp for file transfer protocol" 
+168       exit(0) 
+169     if not cl_serial_number: 
+170       print "serial-number|The serial number to use for the config filename" 
+171     if not cl_cdp_interface: 
+172       print "cdp-interface|The CDP interface to use for the config filename" 
+173     if not cl_protocol: 
+174       print "protocol|The file transfer protocol" 
+175     if not cl_download_only: 
+176       print "download-only|stop after download, dont write boot variables" 
+177     print "<CR>|Run it (use static name for config file)" 
+178     # we are done 
+179     exit(0) 
+180 
+ 
+181 # *** now overwrite env vars with command line vars (if any given) 
+182 # if we get here it is the real deal (no online help case) 
+183 
+ 
+184 argv = sys.argv[1:] 
+185 parse_args(argv) 
+186 if cl_serial_number:  
+187     serial_number=cl_serial_number 
+188     config_file_type = "serial_number" 
+189 if cl_cdp_interface:  
+190     cdp_interface=cl_cdp_interface 
+191     config_file_type = "location" 
+192 if cl_protocol:  
+193     protocol=cl_protocol 
+194 
+ 
+195 
+ 
+196 # setup log file and associated utils 
+197 
+ 
+198 if now == None: 
+199   now=cli("show clock | sed 's/[ :]/_/g'"); 
+200 try: 
+201     log_filename = "%s.%s" % (log_filename, now) 
+202 except Exception as inst: 
+203     print inst 
+204 poap_log_file = open(log_filename, "w+") 
+205 
+ 
+206 def poap_log (info): 
+207     poap_log_file.write(info) 
+208     poap_log_file.write("\n") 
+209     poap_log_file.flush() 
+210     print "poap_py_log:" + info 
+211     sys.stdout.flush() 
+212 
+ 
+213 def poap_log_close (): 
+214     poap_log_file.close() 
+215 
+ 
+216 def abort_cleanup_exit () :  
+217     poap_log("INFO: cleaning up") 
+218     poap_log_close() 
+219     exit(-1) 
+220 
+ 
+221 
+ 
+222 # some argument sanity checks: 
+223 
+ 
+224 if config_file_type == "serial_number" and serial_number == None:  
+225     poap_log("ERR: serial-number required (to derive config name) but none given") 
+226     exit(-1) 
+227 
+ 
+228 if config_file_type == "location" and cdp_interface == None:  
+229     poap_log("ERR: interface required (to derive config name) but none given") 
+230     exit(-1) 
+231 
+ 
+232 # figure out what kind of box we have (to download the correct image) 
+233 try:  
+234   r=clid("show version") 
+235   m = re.match('Nexus9000', r["chassis_id/1"]) 
+236   if m: 
+237     box="n9k" 
+238   else: 
+239     m = re.match('Nexus7000', r["chassis_id"]) 
+240     if m:  
+241       box="n7k" 
+242       m = re.match('.*module-2', r["module_id"]) 
+243       if m: box="n7k2" 
+244     else: box="n9k" 
+245 except: box="n9k" 
+246 print "box is", box 
+247 
+ 
+248 # get final image name based on actual box 
+249 system_image_src    = eval("%s_%s" % (box , "system_image_src"), globals()) 
+250 try: root_path      = eval("%s_%s" % (protocol , "image_dir_src_root"), globals()) 
+251 except: root_path   = "" 
+252 try: username       = eval("%s_%s" % (protocol , "username"), globals()) 
+253 except: pass 
+254 
+ 
+255 # images are copied to temporary location first (dont want to  
+256 # overwrite good images with bad ones). 
+257 system_image_dst_tmp    = "%s%s/%s"     % (image_dir_dst, ".new", system_image_dst) 
+258 system_image_dst        = "%s/%s"       % (image_dir_dst, system_image_dst) 
+259 
+ 
+260 system_image_src        = "%s/%s"       % (image_dir_src, system_image_src) 
+261 
+ 
+262 # cleanup stuff from a previous run 
+263 # by deleting the tmp destination for image files and then recreating the 
+264 # directory 
+265 image_dir_dst_u="/%s" % image_dir_dst.replace(":", "/") # unix path: cli's rmdir not working! 
+266 
+ 
+267 import shutil 
+268 try: shutil.rmtree("%s.new" % image_dir_dst_u) 
+269 except: pass 
+270 os.mkdir("%s.new" % image_dir_dst_u) 
+271 
+ 
+272 if not os.path.exists(image_dir_dst_u): 
+273     os.mkdir(image_dir_dst_u) 
+274 
+ 
+275 import signal 
+276 import string 
+277 
+ 
+278 # utility functions 
+279 
+ 
+280 def run_cli (cmd): 
+281     poap_log("CLI : %s" % cmd) 
+282     return cli(cmd) 
+283 
+ 
+284 def rm_rf (filename):  
+285     try: cli("delete %s" % filename) 
+286     except: pass 
+287 
+ 
+288 # signal handling 
+289 
+ 
+290 def sig_handler_no_exit (signum, frame) :  
+291     poap_log("INFO: SIGTERM Handler while configuring boot variables") 
+292 
+ 
+293 def sigterm_handler (signum, frame):  
+294     poap_log("INFO: SIGTERM Handler")  
+295     abort_cleanup_exit() 
+296     exit(1) 
+297 
+ 
+298 signal.signal(signal.SIGTERM, sigterm_handler) 
+299 
+ 
+300 # transfers file, return True on success; on error exits unless 'fatal' is False in which case we return False 
+301 def doCopy (protocol = "", host = "", source = "", dest = "", vrf = "management", login_timeout=10, user = "", password = "", fatal=True): 
+302     rm_rf(dest) 
+303 
+ 
+304     # mess with source paths (tftp does not like full paths) 
+305     global username, root_path 
+306     source = source[len(root_path):] 
+307 
+ 
+308     cmd = "terminal dont-ask ; terminal password %s ; " % password 
+309     cmd += "copy %s://%s@%s%s %s vrf %s" % (protocol, username, host, source, dest, vrf) 
+310 
+ 
+311     try: run_cli(cmd) 
+312     except: 
+313         poap_log("WARN: Copy Failed: %s" % str(sys.exc_value).strip('\n\r')) 
+314         if fatal: 
+315             poap_log("ERR : aborting") 
+316             abort_cleanup_exit() 
+317             exit(1) 
+318         return False 
+319     return True 
+320 
+ 
+321 
+ 
+322 def get_md5sum_src (file_name): 
+323     md5_file_name_src = "%s.%s" % (file_name, md5sum_ext_src) 
+324     md5_file_name_dst = "volatile:%s.poap_md5" % os.path.basename(md5_file_name_src) 
+325     rm_rf(md5_file_name_dst) 
+326 
+ 
+327     ret=doCopy(protocol, hostname, md5_file_name_src, md5_file_name_dst, vrf, md5sum_timeout, username, password, False) 
+328     if ret == True: 
+329         sum=run_cli("show file %s | grep -v '^#' | head lines 1 | sed 's/ .*$//'" % md5_file_name_dst).strip('\n') 
+330         poap_log("INFO: md5sum %s (.md5 file)" % sum) 
+331         rm_rf(md5_file_name_dst) 
+332         return sum 
+333     return None 
+334     # if no .md5 file, and text file, could try to look for an embedded checksum (see below) 
+335 
+ 
+336 
+ 
+337 def check_embedded_md5sum (filename): 
+338     # extract the embedded checksum 
+339     sum_emb=run_cli("show file %s | grep '^#md5sum' | head lines 1 | sed 's/.*=//'" % filename).strip('\n') 
+340     if sum_emb == "": 
+341         poap_log("INFO: no embedded checksum") 
+342         return None 
+343     poap_log("INFO: md5sum %s (embedded)" % sum_emb) 
+344 
+ 
+345     # remove the embedded checksum (create temp file) before we recalculate 
+346     cmd="show file %s exact | sed '/^#md5sum=/d' > volatile:poap_md5" % filename 
+347     run_cli(cmd) 
+348     # calculate checksum (using temp file without md5sum line) 
+349     sum_dst=run_cli("show file volatile:poap_md5 md5sum").strip('\n') 
+350     poap_log("INFO: md5sum %s (recalculated)" % sum_dst) 
+351     try: run_cli("delete volatile:poap_md5") 
+352     except: pass 
+353     if sum_emb != sum_dst: 
+354         poap_log("ERR : MD5 verification failed for %s" % filename) 
+355         abort_cleanup_exit() 
+356 
+ 
+357     return None 
+358 
+ 
+359 def get_md5sum_dst (filename): 
+360     sum=run_cli("show file %s md5sum" % filename).strip('\n') 
+361     poap_log("INFO: md5sum %s (recalculated)" % sum) 
+362     return sum   
+363 
+ 
+364 def check_md5sum (filename_src, filename_dst, lname): 
+365     md5sum_src = get_md5sum_src(filename_src) 
+366     if md5sum_src: # we found a .md5 file on the server 
+367         md5sum_dst = get_md5sum_dst(filename_dst) 
+368         if md5sum_dst != md5sum_src: 
+369             poap_log("ERR : MD5 verification failed for %s! (%s)" % (lname, filename_dst)) 
+370             abort_cleanup_exit() 
+371 
+ 
+372 def same_images (filename_src, filename_dst): 
+373     if os.path.exists(image_dir_dst_u): 
+374         md5sum_src = get_md5sum_src(filename_src) 
+375         if md5sum_src: 
+376             md5sum_dst = get_md5sum_dst(filename_dst) 
+377             if md5sum_dst == md5sum_src: 
+378                 poap_log("INFO: Same source and destination images" )  
+379                 return True 
+380     poap_log("INFO: Different source and destination images" )  
+381     return False 
+382 
+ 
+383 # Will run our CLI command to test MD5 checksum and if files are valid images 
+384 # This check is also performed while setting the boot variables, but this is an 
+385 # additional check 
+386 
+ 
+387 def get_version (msg): 
+388     lines=msg.split("\n")  
+389     for line in lines: 
+390         index=line.find("MD5") 
+391         if (index!=-1): 
+392             status=line[index+17:] 
+393 
+ 
+394         index=line.find("kickstart:") 
+395         if (index!=-1):  
+396             index=line.find("version") 
+397             ver=line[index:] 
+398             return status,ver 
+399 
+ 
+400         index=line.find("system:") 
+401         if (index!=-1): 
+402             index=line.find("version") 
+403             ver=line[index:] 
+404             return status,ver 
+405      
+406 def verify_images2 (): 
+407     sys_cmd="show version image %s" % system_image_dst 
+408     sys_msg=cli(sys_cmd) 
+409 
+ 
+410     sys_s,sys_v=get_version(sys_msg)     
+411      
+412     print "Value: %s and %s" % (kick_s, sys_s) 
+413     if (kick_s == "Passed" and sys_s == "Passed"): 
+414         # MD5 verification passed 
+415         if(kick_v != sys_v):  
+416             poap_log("ERR : Image version mismatch. (kickstart : %s) (system : %s)" % (kick_v, sys_v)) 
+417             abort_cleanup_exit() 
+418     else: 
+419         poap_log("ERR : MD5 verification failed!") 
+420         poap_log("%s\n%s" % (kick_msg, sys_msg)) 
+421         abort_cleanup_exit() 
+422     poap_log("INFO: Verification passed. (kickstart : %s) (system : %s)" % (kick_v, sys_v)) 
+423     return True 
+424 
+ 
+425 def verify_images (): 
+426     print "show version image %s" % system_image_dst 
+427     sys_cmd="show version image %s" % system_image_dst 
+428     sys_msg=cli(sys_cmd) 
+429     sys_v=sys_msg.split() 
+430     print "system image Values: %s " % (sys_v[2]) 
+431     print "system image Values v10 is : %s" % (sys_v[10]) 
+432     if (sys_v[2] == "Passed"): 
+433         poap_log("INFO: Verification passed. (system : %s)" % (sys_v[10])) 
+434     else: 
+435         poap_log("ERR : MD5 verification failed!") 
+436         poap_log("%s" % (sys_msg)) 
+437         abort_cleanup_exit() 
+438     poap_log("INFO: Verification passed.  (system : %s)" % (sys_v[10])) 
+439     return True 
+440 
+ 
+441 # get config file from server 
+442 def get_config (): 
+443     doCopy(protocol, hostname, config_file_src, config_file_dst, vrf, config_timeout, username, password) 
+444     poap_log("INFO: Completed Copy of Config File")  
+445     # get file's md5 from server (if any) and verify it, failure is fatal (exit) 
+446     check_md5sum (config_file_src, config_file_dst, "config file") 
+447 
+ 
+448 
+ 
+449 # get system image file from server 
+450 def get_system_image (): 
+451     if not same_images(system_image_src, system_image_dst): 
+452         doCopy(protocol, hostname, system_image_src, system_image_dst_tmp, vrf, system_timeout, username, password)   
+453         poap_log("INFO: Completed Copy of System Image" )  
+454         # get file's md5 from server (if any) and verify it, failure is fatal (exit) 
+455         check_md5sum(system_image_src, system_image_dst_tmp, "system image") 
+456         run_cli("move %s %s" % (system_image_dst_tmp, system_image_dst)) 
+457 
+ 
+458 
+ 
+459 def wait_box_online (): 
+460     while 1: 
+461         r=int(run_cli("show system internal platform internal info | grep box_online | sed 's/[^0-9]*//g'").strip('\n')) 
+462         if r==1: break 
+463         else: time.sleep(5) 
+464         poap_log("INFO: Waiting for box online...") 
+465 
+ 
+466 
+ 
+467 # install (make persistent) images and config  
+468 def install_it ():  
+469     global cl_download_only 
+470     if cl_download_only: exit(0) 
+471     timeout = -1 
+472 
+ 
+473     # make sure box is online 
+474     wait_box_online() 
+475 
+ 
+476     poap_log("INFO: Setting the boot variables") 
+477     try: shutil.rmtree("%s.new" % image_dir_dst_u) 
+478     except: pass 
+479     try: 
+480         run_cli("config terminal ; boot nxos %s" % system_image_dst) 
+481         run_cli("copy running-config startup-config") 
+482         run_cli('copy %s scheduled-config' % config_file_dst) 
+483     except: 
+484         poap_log("ERR : setting bootvars or copy run start failed!") 
+485         abort_cleanup_exit() 
+486     # no need to delete config_file_dst, it is in /volatile and we will reboot.... 
+487     # do it anyway so we don't have permission issues when testing script and 
+488     # running as different users (log file have timestamp, so fine) 
+489     poap_log("INFO: Configuration successful") 
+490 
+ 
+491          
+492 # Verify if free space is available to download config, kickstart and system images 
+493 def verify_freespace ():  
+494     freespace = int(cli("dir bootflash: | last 3 | grep free | sed 's/[^0-9]*//g'").strip('\n')) 
+495     freespace = freespace / 1024 
+496     poap_log("INFO: free space is %s kB"  % freespace ) 
+497 
+ 
+498     if required_space > freespace: 
+499         poap_log("ERR : Not enough space to copy the config, kickstart image and system image, aborting!") 
+500         abort_cleanup_exit() 
+501 
+ 
+502 
+ 
+503 # figure out config filename to download based on serial-number 
+504 def set_config_file_src_serial_number ():  
+505     global config_file_src 
+506     config_file_src = "%s.%s" % (config_file_src, serial_number) 
+507     poap_log("INFO: Selected config filename (serial-nb) : %s" % config_file_src) 
+508 
+ 
+509 
+ 
+510 if config_file_type == "serial_number":  
+511     #set source config file based on switch's serial number 
+512     set_config_file_src_serial_number() 
+513 
+ 
+514 
+ 
+515 # finaly do it 
+516 
+ 
+517 verify_freespace() 
+518 get_system_image() 
+519 verify_images() 
+520 get_config() 
+521 
+ 
+522 # dont let people abort the final stage that concretize everything 
+523 # not sure who would send such a signal though!!!! (sysmgr not known to care about vsh) 
+524 signal.signal(signal.SIGTERM, sig_handler_no_exit) 
+525 install_it() 
+526 
+ 
+527 poap_log_close() 
+528 exit(0) 
+529 
+ 
+ 
+
+
+ 
+   
+
+
+
+
+
+
+
+
+  
+
+
+
+
+
