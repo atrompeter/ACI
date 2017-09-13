@@ -1,0 +1,15 @@
+#https://apic-ip-address/api/node/mo/uni.xml
+<polUni>
+<fvTenant dn="uni/tn-Cisco" name="Cisco" ownerKey="" ownerTag="">
+<fvAp name="CCO" ownerKey="" ownerTag="" prio="unspecified">
+<fvAEPg matchT="AtleastOne" name="Web" prio="unspecified">
+<fvRsPathAtt encap="vlan-1201" instrImedcy="immediate" mode="native"
+tDn="topology/pod-1/protpaths-201-202/pathep-[vpc201-202]” />
+</fvAEPg>
+<fvAEPg matchT="AtleastOne" name="App" prio="unspecified">
+<fvRsPathAtt encap="vlan-1202" instrImedcy="immediate" mode="native"
+tDn="topology/pod-1/protpaths-201-202/pathep-[vpc201-202]” />
+</fvAEPg>
+</fvAp>
+</fvTenant>
+</polUni>

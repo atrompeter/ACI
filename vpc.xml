@@ -1,0 +1,39 @@
+#https://apic-ip-address/api/policymgr/mo/.xml
+<polUni>
+<infraInfra>
+<infraNodeP name="switchProfileforVPC_201">
+<infraLeafS name="switchProfileforVPC_201" type="range">
+<infraNodeBlk name="nodeBlk" from_="201" to_="201"/>
+</infraLeafS>
+<infraRsAccPortP tDn="uni/infra/accportprof-intProfileforVPC_201"/>
+</infraNodeP>
+<infraNodeP name="switchProfileforVPC_202">
+<infraLeafS name="switchProfileforVPC_202" type="range">
+<infraNodeBlk name="nodeBlk" from_="202" to_="202"/>
+</infraLeafS>
+<infraRsAccPortP tDn="uni/infra/accportprof-intProfileforVPC_202"/>
+</infraNodeP>
+<infraAccPortP name="intProfileforVPC_201">
+<infraHPortS name="vpc201-202" type="range">
+<infraPortBlk name="vpcPort1-15" fromCard="1" toCard="1" fromPort="15"
+toPort="15"/>
+<infraRsAccBaseGrp tDn="uni/infra/funcprof/accbundle-intPolicyGroupforVPC"/>
+</infraHPortS>
+</infraAccPortP>
+<infraAccPortP name="intProfileforVPC_202">
+<infraHPortS name="vpc201-202" type="range">
+<infraPortBlk name="vpcPort1-1" fromCard="1" toCard="1" fromPort="1"
+toPort="1"/>
+<infraRsAccBaseGrp tDn="uni/infra/funcprof/accbundle-intPolicyGroupforVPC"/>
+</infraHPortS>
+</infraAccPortP>
+<infraFuncP>
+<infraAccBndlGrp name="intPolicyGroupforVPC" lagT="node">
+<infraRsAttEntP tDn="uni/infra/attentp-AttEntityProfileforCisco"/>
+<infraRsCdpIfPol tnCdpIfPolName="CDP_ON" />
+<infraRsLacpPol tnLacpLagPolName="LACP_ACTIVE" />
+<infraRsHIfPol tnFabricHIfPolName="10GigAuto" />
+</infraAccBndlGrp>
+</infraFuncP>
+</infraInfra>
+</polUni>
